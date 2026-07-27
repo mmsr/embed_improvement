@@ -1,0 +1,278 @@
+"""Evaluation for numeracy embedding models: triplet metrics, similarity probes,
+and ordering scores (Spearman vs log-distance). No model is loaded at import time;
+every function takes (model, tokenizer) explicitly so the same session can compare
+several checkpoints. Entry point: evaluate_adapter()."""
+from __future__ import annotations
+
+import json
+import math
+import random
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
+RECALL_K = [1, 5, 10]
+NUM_SAMPLED_NEGATIVES = 8
+
+
+def load_eval_model(base_model: str, adapter_path: str | None = None, device: str | None = None):
+    """Load base encoder, optionally with a LoRA adapter, in eval mode."""
+    from transformers import AutoModel, AutoTokenizer
+
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    model = AutoModel.from_pretrained(base_model)
+    if adapter_path:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, adapter_path)
+    return model.to(device).eval(), tokenizer
+
+
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output.last_hidden_state
+    mask = attention_mask.unsqueeze(-1).float()
+    return (token_embeddings * mask).sum(dim=1) / mask.sum(dim=1)
+
+
+@torch.no_grad()
+def embed_texts(model, tokenizer, texts, batch_size=32, max_length=128, progress=True):
+    """L2-normalized mean-pooled embeddings, (N, hidden) numpy array."""
+    device = next(model.parameters()).device
+    all_emb = []
+    rng = range(0, len(texts), batch_size)
+    for i in tqdm(rng, desc="Embedding", leave=False, disable=not progress):
+        inputs = tokenizer(
+            texts[i : i + batch_size],
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        ).to(device)
+        emb = mean_pooling(model(**inputs), inputs["attention_mask"])
+        all_emb.append(F.normalize(emb, p=2, dim=1).cpu())
+    return torch.cat(all_emb, dim=0).numpy()
+
+
+############################################
+# TRIPLET METRICS
+############################################
+
+def triplet_accuracy(A, P, N):
+    return float(np.mean(np.sum(A * P, axis=1) > np.sum(A * N, axis=1)))
+
+
+def cosine_gap(A, P, N):
+    return float(np.mean(np.sum(A * P, axis=1) - np.sum(A * N, axis=1)))
+
+
+def pairwise_mrr(A, P, N):
+    pos = np.sum(A * P, axis=1)
+    neg = np.sum(A * N, axis=1)
+    return float(np.mean(1.0 / np.where(pos > neg, 1, 2)))
+
+
+def _sampled_candidates(rng, i, n, P, N, num_extra_negs):
+    neg_idx = rng.sample([j for j in range(n) if j != i], min(num_extra_negs, n - 1))
+    return [P[i], N[i]] + [N[j] for j in neg_idx]
+
+
+def recall_at_k_sampled(A, P, N, k, num_extra_negs=8, seed=42):
+    rng = random.Random(seed)
+    n = len(A)
+    hits = []
+    for i in range(n):
+        candidates = _sampled_candidates(rng, i, n, P, N, num_extra_negs)
+        topk = np.argsort(-np.dot(candidates, A[i]))[:k]
+        hits.append(0 in topk)  # index 0 = positive
+    return float(np.mean(hits))
+
+
+def mrr_at_k_sampled(A, P, N, k, num_extra_negs=8, seed=42):
+    rng = random.Random(seed)
+    n = len(A)
+    rr = []
+    for i in range(n):
+        candidates = _sampled_candidates(rng, i, n, P, N, num_extra_negs)
+        order = np.argsort(-np.dot(candidates, A[i]))
+        rank = int(np.where(order == 0)[0][0]) + 1
+        rr.append(1.0 / rank if rank <= k else 0.0)
+    return float(np.mean(rr))
+
+
+def load_triplets(path):
+    anchors, positives, negatives = [], [], []
+    with open(path) as f:
+        for line in f:
+            row = json.loads(line)
+            anchors.append(row.get("anchor") or row["comment"])
+            positives.append(row.get("positive_rewritten") or row["positive"])
+            negatives.append(row.get("negative_rewritten") or row["negative"])
+    return anchors, positives, negatives
+
+
+def evaluate_triplets(model, tokenizer, triplet_file, batch_size=32, max_length=128):
+    """Full triplet metric dict for one JSONL file."""
+    anchors, positives, negatives = load_triplets(triplet_file)
+    A = embed_texts(model, tokenizer, anchors, batch_size, max_length)
+    P = embed_texts(model, tokenizer, positives, batch_size, max_length)
+    N = embed_texts(model, tokenizer, negatives, batch_size, max_length)
+
+    results = {
+        "n_triplets": len(anchors),
+        "triplet_accuracy": triplet_accuracy(A, P, N),
+        "cosine_gap": cosine_gap(A, P, N),
+        "pairwise_mrr": pairwise_mrr(A, P, N),
+    }
+    for k in RECALL_K:
+        results[f"recall@{k}"] = recall_at_k_sampled(A, P, N, k, NUM_SAMPLED_NEGATIVES)
+        results[f"mrr@{k}"] = mrr_at_k_sampled(A, P, N, k, NUM_SAMPLED_NEGATIVES)
+    return results
+
+
+############################################
+# ORDERING PROBES (test suites)
+############################################
+
+TEST_SUITES = {
+    "digit_bias": {
+        "anchor": "321 ml",
+        "candidates": ["320 ml", "329 ml", "312 ml", "301 ml", "231 ml",
+                       "132 ml", "123 ml", "221 ml", "421 ml"],
+        "description": "Left-to-right digit bias: are first-digit matches overweighted?",
+    },
+    "monotonic_decay": {
+        "anchor": "500 ml",
+        "candidates": ["499 ml", "501 ml", "490 ml", "510 ml", "450 ml", "550 ml",
+                       "400 ml", "600 ml", "300 ml", "700 ml", "100 ml", "900 ml"],
+        "description": "Near-tie ordering: does similarity decay with numeric distance?",
+    },
+    "place_value": {
+        "anchor": "345 ml",
+        "candidates": ["346 ml", "355 ml", "445 ml", "344 ml", "335 ml", "245 ml"],
+        "description": "Is a +-1 change scored closer than +-10 or +-100?",
+    },
+    "prefix_trap": {
+        "anchor": "199 ml",
+        "candidates": ["200 ml", "198 ml", "190 ml", "299 ml", "109 ml", "119 ml", "999 ml"],
+        "description": "Does the true nearest neighbor beat digit-sharing distractors?",
+    },
+    "permutation_trap": {
+        "anchor": "247 ml",
+        "candidates": ["274 ml", "427 ml", "724 ml", "742 ml", "472 ml",
+                       "200 ml", "250 ml", "300 ml"],
+        "description": "Are permuted digits confused with numeric proximity?",
+    },
+}
+
+
+def make_random_suites(n_suites=20, seed=42, units=("ml", "kg", "USD", "shares", "%")):
+    """Randomized ordering suites across magnitudes/units, for robustness beyond
+    the 5 hand-picked probes (which stay fixed for comparability with old results)."""
+    rng = random.Random(seed)
+    suites = {}
+    for i in range(n_suites):
+        unit = rng.choice(units)
+        anchor = round(rng.uniform(1, 10) * 10 ** rng.randint(0, 5), 2)
+        ratios = [1.002, 1.02, 1.1, 1.25, 1.5, 2.0, 5.0, 20.0]
+        cands = []
+        for r in ratios:
+            r = r if rng.random() < 0.5 else 1.0 / r
+            cands.append(f"{round(anchor * r, 2):g} {unit}")
+        suites[f"random_{i}"] = {
+            "anchor": f"{anchor:g} {unit}",
+            "candidates": cands,
+            "description": "randomized ordering probe",
+        }
+    return suites
+
+
+def _spearman(x, y):
+    def rank(a):
+        order = np.argsort(a)
+        r = np.empty(len(a))
+        r[order] = np.arange(len(a))
+        return r
+    rx, ry = rank(np.asarray(x, float)), rank(np.asarray(y, float))
+    if rx.std() == 0 or ry.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def score_suite(model, tokenizer, anchor, candidates, max_length=128):
+    """Ordering quality for one probe: Spearman rho between similarity rank and
+    |log ratio| distance rank (1.0 = perfect numeric ordering), plus sim spread."""
+    texts = [anchor] + list(candidates)
+    embs = embed_texts(model, tokenizer, texts, max_length=max_length, progress=False)
+    sims = embs[1:] @ embs[0]
+    anchor_val = float(anchor.split()[0].replace(",", ""))
+    log_dists = [
+        abs(math.log(float(c.split()[0].replace(",", "")) / anchor_val))
+        for c in candidates
+    ]
+    return {
+        "spearman": _spearman(-sims, log_dists),
+        "sim_spread": float(sims.max() - sims.min()),
+        "ranking": sorted(zip(candidates, sims.tolist()), key=lambda t: -t[1]),
+    }
+
+
+def ordering_scores(model, tokenizer, suites=None, max_length=128, verbose=False):
+    """Run all suites; returns flat metrics: ordering@<suite> per suite plus
+    ordering_mean and sim_spread_mean (the two headline numbers)."""
+    suites = suites or TEST_SUITES
+    out, rhos, spreads = {}, [], []
+    for name, s in suites.items():
+        r = score_suite(model, tokenizer, s["anchor"], s["candidates"], max_length)
+        out[f"ordering@{name}"] = round(r["spearman"], 4)
+        rhos.append(r["spearman"])
+        spreads.append(r["sim_spread"])
+        if verbose:
+            print(f"\n{name}: rho={r['spearman']:.3f}  spread={r['sim_spread']:.3f}"
+                  f"  ({s['description']})")
+            print(f"  Anchor: {s['anchor']}")
+            for text, sim in r["ranking"]:
+                print(f"  {text:>12} : {sim:.4f}")
+    out["ordering_mean"] = round(float(np.nanmean(rhos)), 4)
+    out["sim_spread_mean"] = round(float(np.mean(spreads)), 4)
+    return out
+
+
+############################################
+# TOP-LEVEL RUNNER
+############################################
+
+def evaluate_adapter(
+    base_model: str,
+    adapter_path: str | None,
+    triplet_files: dict[str, str] | None = None,
+    include_random_suites: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """Evaluate one checkpoint end to end. triplet_files maps a short label
+    (e.g. 'test_same') to a JSONL path; labels prefix the metric names.
+    Returns one flat dict ready for training.experiment.log_result()."""
+    model, tokenizer = load_eval_model(base_model, adapter_path)
+    metrics: dict = {}
+
+    for label, path in (triplet_files or {}).items():
+        if verbose:
+            print(f"── triplets: {label} ──")
+        res = evaluate_triplets(model, tokenizer, path)
+        metrics.update({f"{label}/{k}": v for k, v in res.items()})
+        if verbose:
+            for k, v in res.items():
+                print(f"  {k:<20s}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+
+    metrics.update(ordering_scores(model, tokenizer, verbose=verbose))
+    if include_random_suites:
+        rand = ordering_scores(model, tokenizer, suites=make_random_suites())
+        metrics["ordering_mean_random"] = rand["ordering_mean"]
+        metrics["sim_spread_mean_random"] = rand["sim_spread_mean"]
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return metrics
