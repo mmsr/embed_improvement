@@ -43,7 +43,7 @@ training/
   config.py      # RunConfig — every hyperparameter that varies between experiments
   data.py        # TripletDataset, make_triplet_collator
   model.py       # mean_pooling, ContrastiveModel, build_model() (fresh LoRA or continue an adapter)
-  losses.py      # LOSS_REGISTRY — both loss variants from the notebook, selected by name
+  losses.py      # LOSS_REGISTRY — loss variants from the notebooks, selected by name
   train.py       # train_one_run(config, work_dir) — the whole training loop
   experiment.py  # new_run_id, save_run, save_checkpoint, log_result, load_registry
 colab/
@@ -71,12 +71,25 @@ fixed schema breaking old rows.
   function from `training.losses.LOSS_REGISTRY`. Trying a new combination is a `RunConfig(...)`
   edit in the notebook's config cell, not a copy of the whole notebook. Add a new loss variant by
   writing one function in `losses.py` and adding it to `LOSS_REGISTRY` — nothing else changes.
-- **The notebook actually had two definitions of `improved_numeric_loss`**; the second (cell 13)
-  silently shadowed the first at runtime, so the first was dead code, and it wasn't obvious which
-  one had actually trained past runs. Both are preserved under honest names —
+- **`embed_trainer_3.ipynb` actually had two definitions of `improved_numeric_loss`**; the second
+  (cell 13) silently shadowed the first at runtime, so the first was dead code, and it wasn't
+  obvious which one had actually trained past runs. Both are preserved under honest names —
   `dynamic_margin_sigmoid_loss` (the first, unused-in-practice version) and
   `dynamic_margin_softplus_loss` (the second, the one that was actually training) — so either can
   be selected deliberately, and it's explicit in `registry.jsonl` which one produced a given run.
+- **`embed_trainer_infosec_4132026.ipynb`** (the latest loss code tried) has the same
+  `improved_numeric_loss` math as `dynamic_margin_softplus_loss` with one real difference: the
+  rank-loss margin is `0.3` there, not `0.1`. Added as a third registry entry,
+  `dynamic_margin_softplus_infosec_loss` (`loss_fn="dynamic_margin_softplus_infosec"`), rather
+  than parameterizing the existing function, so both stay selectable and neither's behavior
+  changes silently. That notebook's full recipe (this loss + `tok_embeddings` LoRA + unfreezing
+  ModernBERT's norm layers via `modules_to_save`) scored ordering rho=0.73 in the earlier
+  analysis — worse than the untouched trainer_3-era CLD3-old's 0.93 — so it isn't the default;
+  it's there to A/B against `dynamic_margin_softplus` directly by changing one config field.
+  The LoRA side of that notebook (adapting `tok_embeddings`, plus `modules_to_save=["attn_norm",
+  "mlp_norm", "emb_norm"]` to fully fine-tune ModernBERT's LayerNorms alongside the LoRA adapters)
+  is now expressible via `RunConfig.target_modules` / `RunConfig.modules_to_save` (new field,
+  `None` by default = LoRA-only, matching `embed_trainer_3.ipynb`).
 - **Every run gets its own `run_id` and its own directory**, generated once via `new_run_id()` and
   reused consistently for the accelerator resume state, every epoch checkpoint, and the final
   adapter. Previously `CHECKPOINT_DIR = WORK_DIR/checkpoints_final_margin` was one fixed path
@@ -178,10 +191,101 @@ Regenerated (seed 42): `data/train_triplets_graded.jsonl` (96,000) →
 `data/train_sentences_graded.jsonl` (95,904; 100% offset-exact, **0 substitution mismatches**).
 Negative hardness: 14.9% within 1.2x, 40.3% within 1.5x, median 2.2x
 (was 1.4% / 2.6% / 50x). Not yet done downstream: the LLM rewriting pass
-(`data_rewriter/main.py`, costs OpenAI credits) and re-splitting (`data_splitter.py`) —
-until then the new file's `positive`/`negative` fields can be trained on directly
-(lexical variety comes only from the rewriter). Known quirk kept: `MAG_TARGETS` sums to
-0.96, so `--total 100000` yields 96k records.
+(`data_rewriter/main.py`, costs OpenAI credits) — until then the `positive`/`negative`
+fields can be trained on directly (lexical variety comes only from the rewriter). Known
+quirk kept: `MAG_TARGETS` sums to 0.96, so `--total 100000` yields 96k records.
+
+**Splits (2026-07-27, `utils/split_dataset.py`, seed 42):** the graded file had two leakage
+risks a naive split would hit — 7,230 source records duplicated by replacement
+oversampling (one comment appears 34x), and 1,213 records (1.3%) sharing their anchor
+comment with the old `test_*_extracted.jsonl`/`val_extracted.jsonl` files. The splitter
+drops the contaminated records (so old test sets stay valid for old-vs-new comparisons)
+and splits by comment-group so no comment straddles splits (verified: 0 leaks). Outputs:
+`data/graded_train.jsonl` (75,921), `data/graded_val.jsonl` (9,433),
+`data/graded_test.jsonl` (9,337) — near/mid/far band mix preserved in each. Use
+`graded_val.jsonl` for validation: the old `val.jsonl`'s negatives are the 50x kind, so
+val loss on it cannot see near-tie learning.
+
+## Core-problem diagnosis (2026-07-26) and the fixes implemented
+
+Why many loss variants (simple triplet → infosec's complex multi-term) showed no eval
+improvement — responsibility estimate:
+
+1. **Train/eval space mismatch (~40%).** All metric losses shaped
+   `normalize(metric_proj(emb))`; only the encoder was saved/evaluated. Evidence: the
+   log-distance term demands cosine spread > 1.0, measured encoder-space spread was
+   0.07–0.12 across every fine-tune. Loss changes were filtered through a space eval never
+   saw, so they all looked alike. **Fix:** `RunConfig.use_metric_proj=False` (new default) —
+   losses apply to the normalized pooled encoder output; `metric_proj` only exists when
+   explicitly enabled; auxiliary heads persisted per run (`aux_heads.pt`) and restored by
+   `init_from_adapter`.
+2. **Data (~35%).** The 50x-fallback negatives (see Data preparation section) meant near-tie
+   ordering was unconstrained. **Fix:** graded data already regenerated
+   (`train_sentences_graded.jsonl`).
+3. **Loss form (~20%).** The log-distance MSE is regression-to-cosine — CoSENT showed
+   ranking-only objectives beat it for exactly this reason; triplets are pairwise and can't
+   express listwise monotonicity; the unbounded margin kept gradient on easy far pairs;
+   head_loss (~60 at init) dominated early training. **Fixes (new registry entries, existing
+   losses untouched):** `cosent_log_ratio` (graded CoSENT over in-batch pairs, target
+   −|log ratio|, τ=`loss_tau`), `cosent_plus_head` (+ downweighted normalized head), and
+   `dynamic_margin_softplus_capped` (margin cap 0.8 + head targets /20).
+4. **LoRA settings (~5%).** r=16/α=32 is fine and not the bottleneck; literature shows LoRA
+   matches full fine-tuning for contrastive embedding adaptation. Default `target_modules`
+   corrected to honest names `["Wqkv","Wo","Wi"]` (identical adapted set — "out_proj"
+   matched nothing). tok_embeddings/norm-unfreezing (infosec) stays opt-in; it regressed.
+5. **Loop hygiene:** `seed`, warmup+cosine schedule (`lr_schedule="none"` restores constant
+   LR), `grad_clip`, and per-epoch ordering-ρ probes (`ordering_eval_each_epoch`) logged to
+   wandb so checkpoint selection uses the metric that matters.
+
+Key references: [CoSENT (TASLP 2024)](https://penghao-bdsc.github.io/papers/CoSENT_TASLP2024.pdf),
+[MNR/in-batch negatives](https://github.com/huggingface/sentence-transformers/blob/main/sentence_transformers/losses/MultipleNegativesRankingLoss.py),
+[Wallace et al. 2019 numeracy probing](https://aclanthology.org/D19-1534/),
+[xVal continuous number encoding](https://arxiv.org/abs/2310.02989) (longer-term option for
+tokenization artifacts).
+
+First recommended run: graded data + `use_metric_proj=False` + `loss_fn="cosent_log_ratio"`
+(the pre-filled config in `colab/train_run.ipynb`), compared against the Phase-0 baselines.
+
+## LoRA hyperparameters (researched 2026-07-27, set as defaults)
+
+- **Learning rate `lora_lr=2e-4`** (was 5e-5): the LoRA optimum is consistently ~10x the
+  full-fine-tuning LR, independent of base model ([Thinking Machines "LoRA Without
+  Regret"](https://thinkingmachines.ai/blog/lora/); [LR scaling across
+  ranks](https://arxiv.org/html/2602.06204v1)). The old notebooks used the full-FT-style
+  2e-5. Safe with the warmup+cosine schedule and grad clipping now in the loop.
+- **`target_modules=["Wqkv","Wo","Wi"]` = all linear layers**: attention-only LoRA
+  significantly underperforms even at matched parameter count — MLP layers are where the
+  capacity lives (Thinking Machines; also the QLoRA finding echoed in the
+  [Unsloth guide](https://unsloth.ai/docs/get-started/fine-tuning-llms-guide/lora-hyperparameters-guide)).
+- **`r=16, alpha=32` (alpha = 2r)**: the standard best-practice ratio (Raschka); rank has
+  little effect at this data scale (~76k examples), and optimal LR is roughly
+  rank-independent due to the alpha/r prefactor. Not worth sweeping before the loss/data
+  results are in.
+- **`use_rslora` flag added (default False)**: alpha/sqrt(r) scaling matters only for
+  r >= 64, where standard alpha/r collapses gradients
+  ([rsLoRA paper](https://arxiv.org/abs/2312.03732)) — enable it for the high-rank ablation.
+- **`batch_size=32` kept**: LoRA tolerates large batches worse than full fine-tuning
+  (gap grows with batch size, not mitigated by rank — Thinking Machines), while 32 triplets
+  already yield 64 in-batch pairs (~2k ranking comparisons) for the cosent losses. 64 is a
+  reasonable A100 variant.
+
+## Recommended Colab run sequence
+
+All runs: graded splits, `use_metric_proj=False`, defaults above; one variable per run.
+
+0. **Baselines (eval-only, once):** base ModernBERT (`adapter_path=None`) through the eval
+   section; if the Drive copy of the CLD3-old-era adapter can be found, evaluate it too.
+1. **run1 (pre-filled in the notebook):** `loss_fn="cosent_log_ratio"` — the headline recipe.
+2. **run2:** `loss_fn="cosent_plus_head"` — does the auxiliary magnitude head help?
+3. **run3:** `loss_fn="dynamic_margin_softplus_capped"` — best margin-family variant, for the
+   loss-family comparison row.
+4. **run4 (baseline row):** `loss_fn="dynamic_margin_softplus"`, `lr_schedule="none"`,
+   `lora_lr=5e-5`, `use_metric_proj=True` — the old trainer_3 recipe on the new data, so the
+   paper can attribute gains to loss/space fixes vs data fixes separately.
+5. Then: tau ablation (0.03/0.1) on the run1-vs-run2 winner, and the LoRA ablations
+   (r ∈ {8, 64 + rslora}, +tok_embeddings) only after the loss winner is fixed.
+
+Checkpoint selection: per-epoch `ordering_mean` (logged automatically), not val loss.
 
 ## Experiment plan (for the paper)
 
