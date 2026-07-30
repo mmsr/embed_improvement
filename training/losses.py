@@ -247,6 +247,115 @@ def dynamic_margin_softplus_infosec_loss(
 HEAD_TARGET_SCALE = 20.0
 
 
+def dynamic_margin_sigmoid_balanced_loss(
+    anchor_emb,
+    pos_emb,
+    neg_emb,
+    anchor_score,
+    pos_score,
+    neg_score,
+    anchor_value,
+    pos_value,
+    neg_value,
+    base_margin=0.2,
+    alpha=0.5,
+    beta=0.4,
+    eps=1e-8,
+):
+    """Scale-safe correction of :func:`dynamic_margin_sigmoid_loss`.
+
+    It retains the original four signals (triplet ordering, distance
+    calibration, magnitude decoding, and direction ranking), but changes how
+    each signal is allocated:
+
+    * the sigmoid margin is largest for ambiguous near-gap triplets and falls
+      toward ``base_margin`` for easy far negatives;
+        * metric distance uses the Paper-1 absolute log-ratio geometry rather than
+            mixing it with the magnitude head's ``log1p`` target;
+        * the calibration curve is ``0.5 * d/(1+d)``, which is monotonic but keeps
+      the implied target cosine in [0, 1] instead of pushing far, semantically
+      related sentences toward cosine -1;
+    * Smooth L1 replaces calibration/head MSE to reduce outlier influence;
+    * head targets and its directional margin use the same normalized scale;
+    * a temperature-scaled Softplus replaces the discontinuous hard hinge.
+
+    This is a new experimental loss, not a claim that the corrected composite
+    will outperform the simpler ``cosent_log_ratio`` baseline.
+    """
+    anchor = F.normalize(anchor_emb, dim=-1)
+    pos = F.normalize(pos_emb, dim=-1)
+    neg = F.normalize(neg_emb, dim=-1)
+
+    pos_cos_dist = 1.0 - F.cosine_similarity(anchor, pos, dim=-1)
+    neg_cos_dist = 1.0 - F.cosine_similarity(anchor, neg, dim=-1)
+
+    metric_log_a = torch.log(anchor_value + eps)
+    metric_log_p = torch.log(pos_value + eps)
+    metric_log_n = torch.log(neg_value + eps)
+    log_pos_dist = torch.abs(metric_log_a - metric_log_p)
+    log_neg_dist = torch.abs(metric_log_a - metric_log_n)
+
+    # Valid triplets have gap >= 0. Near/ambiguous gaps receive up to 1.5*m0;
+    # easy far gaps approach m0, so they deactivate instead of owning a batch.
+    distance_gap = (log_neg_dist - log_pos_dist).clamp(min=0.0)
+    dyn_margin = base_margin * (1.0 + torch.sigmoid(-distance_gap))
+    triplet_loss = F.relu(
+        pos_cos_dist - neg_cos_dist + dyn_margin
+    ).mean()
+
+    # d/(1+d) retains more separation among medium/far values than tanh. The
+    # 0.5 semantic guardrail maps target normalized cosine distance to [0,.5),
+    # hence target cosine similarity remains in (0,1] rather than approaching -1.
+    def calibration_target(distance):
+        return 0.5 * distance / (1.0 + distance)
+
+    calibration_loss = (
+        F.smooth_l1_loss(pos_cos_dist / 2.0, calibration_target(log_pos_dist))
+        + F.smooth_l1_loss(neg_cos_dist / 2.0, calibration_target(log_neg_dist))
+    ) / 2.0
+
+    target_a = torch.log1p(anchor_value) / HEAD_TARGET_SCALE
+    target_p = torch.log1p(pos_value) / HEAD_TARGET_SCALE
+    target_n = torch.log1p(neg_value) / HEAD_TARGET_SCALE
+    head_loss = (
+        F.smooth_l1_loss(anchor_score, target_a)
+        + F.smooth_l1_loss(pos_score, target_p)
+        + F.smooth_l1_loss(neg_score, target_n)
+    ) / 3.0
+
+    # Direction is auxiliary: use a small margin in normalized target units
+    # and a smooth, temperature-scaled penalty whose magnitude stays bounded.
+    rank_margin = 0.1 / HEAD_TARGET_SCALE
+    rank_temperature = 0.05
+    ap_direction = torch.sign(target_a - target_p)
+    an_direction = torch.sign(target_a - target_n)
+
+    def smooth_rank(direction, score_gap):
+        violation = (rank_margin - direction * score_gap) / rank_temperature
+        return (rank_temperature * F.softplus(violation)).mean()
+
+    rank_loss = (
+        smooth_rank(ap_direction, anchor_score - pos_score)
+        + smooth_rank(an_direction, anchor_score - neg_score)
+    ) / 2.0
+
+    metric_loss = triplet_loss + calibration_loss
+    supervision_loss = beta * head_loss + (1.0 - beta) * rank_loss
+    total_loss = alpha * metric_loss + (1.0 - alpha) * supervision_loss
+
+    components = {
+        "triplet": triplet_loss.item(),
+        "calibration": calibration_loss.item(),
+        "head": head_loss.item(),
+        "rank": rank_loss.item(),
+        "margin_mean": dyn_margin.mean().item(),
+        "metric": metric_loss.item(),
+        "supervision": supervision_loss.item(),
+        "total": total_loss.item(),
+    }
+    return total_loss, components
+
+
 def _graded_pair_scores(anchor, pos, neg, anchor_value, pos_value, neg_value, eps):
     """Flatten a triplet batch into 2B (anchor, candidate) pairs with cosine
     similarity and a graded, unit-free target = -|log ratio| (higher = closer)."""
@@ -438,11 +547,125 @@ def dynamic_margin_softplus_capped_loss(
     return total_loss, components
 
 
+def dynamic_margin_softplus_v2_loss(
+    anchor_emb,
+    pos_emb,
+    neg_emb,
+    anchor_score,
+    pos_score,
+    neg_score,
+    anchor_value,
+    pos_value,
+    neg_value,
+    base_margin=0.2,
+    alpha=0.5,
+    beta=0.4,
+    tau=0.05,
+    eps=1e-8,
+):
+    """Scale-safe v2 of the historical three-edge Softplus composite.
+
+    The historical strengths are retained: anchor-positive/anchor-negative
+    triplet ordering, calibration of all three triangle edges, magnitude
+    decoding, and smooth direction ranking. The unsafe details are replaced:
+
+    * all metric terms use absolute log-ratio distance;
+    * the bounded dynamic margin is strongest for ambiguous near-gap rows and
+      approaches ``base_margin`` for easy far negatives;
+    * calibration maps to nonnegative target cosine and uses Smooth L1;
+    * magnitude targets and the rank margin share a normalized scale;
+    * temperature-scaled Softplus keeps rank-loss magnitude controlled.
+
+    ``tau`` is the smooth-rank temperature. It is intentionally exposed through
+    ``RunConfig.loss_tau`` so a later ablation can change it without code edits.
+    """
+    anchor = F.normalize(anchor_emb, dim=-1)
+    pos = F.normalize(pos_emb, dim=-1)
+    neg = F.normalize(neg_emb, dim=-1)
+
+    pos_cos_dist = 1.0 - F.cosine_similarity(anchor, pos, dim=-1)
+    neg_cos_dist = 1.0 - F.cosine_similarity(anchor, neg, dim=-1)
+    pn_cos_dist = 1.0 - F.cosine_similarity(pos, neg, dim=-1)
+
+    metric_log_a = torch.log(anchor_value + eps)
+    metric_log_p = torch.log(pos_value + eps)
+    metric_log_n = torch.log(neg_value + eps)
+    pos_numeric_dist = torch.abs(metric_log_a - metric_log_p)
+    neg_numeric_dist = torch.abs(metric_log_a - metric_log_n)
+    pn_numeric_dist = torch.abs(metric_log_p - metric_log_n)
+
+    # At an ambiguous gap of zero the margin is 1.5*m0. As a negative becomes
+    # clearly farther than the positive, the margin smoothly approaches m0.
+    numeric_gap = (neg_numeric_dist - pos_numeric_dist).clamp(min=0.0)
+    dyn_margin = base_margin * (1.0 + 0.5 / (1.0 + numeric_gap))
+    triplet_loss = F.relu(
+        pos_cos_dist - neg_cos_dist + dyn_margin
+    ).mean()
+
+    # If normalized cosine distance equals this target, the implied cosine is
+    # 1/(1+d): monotonic, positive, and less destructive to semantic geometry.
+    def calibration_target(distance):
+        return 0.5 * distance / (1.0 + distance)
+
+    calibration_loss = (
+        F.smooth_l1_loss(
+            pos_cos_dist / 2.0, calibration_target(pos_numeric_dist)
+        )
+        + F.smooth_l1_loss(
+            neg_cos_dist / 2.0, calibration_target(neg_numeric_dist)
+        )
+        + F.smooth_l1_loss(
+            pn_cos_dist / 2.0, calibration_target(pn_numeric_dist)
+        )
+    ) / 3.0
+
+    target_a = torch.log1p(anchor_value) / HEAD_TARGET_SCALE
+    target_p = torch.log1p(pos_value) / HEAD_TARGET_SCALE
+    target_n = torch.log1p(neg_value) / HEAD_TARGET_SCALE
+    head_loss = (
+        F.smooth_l1_loss(anchor_score, target_a)
+        + F.smooth_l1_loss(pos_score, target_p)
+        + F.smooth_l1_loss(neg_score, target_n)
+    ) / 3.0
+
+    rank_margin = 0.1 / HEAD_TARGET_SCALE
+    safe_tau = max(float(tau), eps)
+    ap_direction = torch.sign(target_a - target_p)
+    an_direction = torch.sign(target_a - target_n)
+
+    def smooth_rank(direction, score_gap):
+        violation = (rank_margin - direction * score_gap) / safe_tau
+        return (safe_tau * F.softplus(violation)).mean()
+
+    rank_loss = (
+        smooth_rank(ap_direction, anchor_score - pos_score)
+        + smooth_rank(an_direction, anchor_score - neg_score)
+    ) / 2.0
+
+    metric_loss = triplet_loss + calibration_loss
+    supervision_loss = beta * head_loss + (1.0 - beta) * rank_loss
+    total_loss = alpha * metric_loss + (1.0 - alpha) * supervision_loss
+
+    components = {
+        "triplet": triplet_loss.item(),
+        "calibration": calibration_loss.item(),
+        "head": head_loss.item(),
+        "rank": rank_loss.item(),
+        "margin_mean": dyn_margin.mean().item(),
+        "metric": metric_loss.item(),
+        "supervision": supervision_loss.item(),
+        "total": total_loss.item(),
+    }
+    return total_loss, components
+
+
 LOSS_REGISTRY = {
     "dynamic_margin_sigmoid": dynamic_margin_sigmoid_loss,
+    "dynamic_margin_sigmoid_balanced": dynamic_margin_sigmoid_balanced_loss,
     "dynamic_margin_softplus": dynamic_margin_softplus_loss,
     "dynamic_margin_softplus_infosec": dynamic_margin_softplus_infosec_loss,
     "dynamic_margin_softplus_capped": dynamic_margin_softplus_capped_loss,
+    "dynamic_margin_softplus_v2": dynamic_margin_softplus_v2_loss,
     "cosent_log_ratio": cosent_log_ratio_loss,
     "cosent_plus_head": cosent_plus_head_loss,
 }
