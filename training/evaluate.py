@@ -104,21 +104,37 @@ def mrr_at_k_sampled(A, P, N, k, num_extra_negs=8, seed=42):
 
 def load_triplets(path):
     anchors, positives, negatives = [], [], []
+    anchor_values, positive_values, negative_values = [], [], []
     with open(path) as f:
         for line in f:
             row = json.loads(line)
             anchors.append(row.get("anchor") or row["comment"])
             positives.append(row.get("positive_rewritten") or row["positive"])
             negatives.append(row.get("negative_rewritten") or row["negative"])
-    return anchors, positives, negatives
+            anchor_values.append(float(row["number"]))
+            positive_values.append(float(row["positive_number"]))
+            negative_values.append(float(row["negative_number"]))
+    return (
+        anchors,
+        positives,
+        negatives,
+        np.asarray(anchor_values),
+        np.asarray(positive_values),
+        np.asarray(negative_values),
+    )
 
 
 def evaluate_triplets(model, tokenizer, triplet_file, batch_size=32, max_length=128):
     """Full triplet metric dict for one JSONL file."""
-    anchors, positives, negatives = load_triplets(triplet_file)
+    anchors, positives, negatives, anchor_values, _, negative_values = load_triplets(
+        triplet_file
+    )
     A = embed_texts(model, tokenizer, anchors, batch_size, max_length)
     P = embed_texts(model, tokenizer, positives, batch_size, max_length)
     N = embed_texts(model, tokenizer, negatives, batch_size, max_length)
+
+    pos_sims = np.sum(A * P, axis=1)
+    neg_sims = np.sum(A * N, axis=1)
 
     results = {
         "n_triplets": len(anchors),
@@ -129,6 +145,26 @@ def evaluate_triplets(model, tokenizer, triplet_file, batch_size=32, max_length=
     for k in RECALL_K:
         results[f"recall@{k}"] = recall_at_k_sampled(A, P, N, k, NUM_SAMPLED_NEGATIVES)
         results[f"mrr@{k}"] = mrr_at_k_sampled(A, P, N, k, NUM_SAMPLED_NEGATIVES)
+
+    symmetric_ratio = np.maximum(anchor_values, negative_values) / np.minimum(
+        anchor_values, negative_values
+    )
+    slices = {
+        "very_near_<1.2x": symmetric_ratio < 1.2,
+        "near_<1.5x": symmetric_ratio < 1.5,
+        "mid_1.5-5x": (symmetric_ratio >= 1.5) & (symmetric_ratio < 5.0),
+        "far_>=5x": symmetric_ratio >= 5.0,
+    }
+    for name, mask in slices.items():
+        count = int(mask.sum())
+        results[f"slice/{name}/n"] = count
+        if count:
+            results[f"slice/{name}/triplet_accuracy"] = float(
+                np.mean(pos_sims[mask] > neg_sims[mask])
+            )
+            results[f"slice/{name}/cosine_gap"] = float(
+                np.mean(pos_sims[mask] - neg_sims[mask])
+            )
     return results
 
 
@@ -137,6 +173,12 @@ def evaluate_triplets(model, tokenizer, triplet_file, batch_size=32, max_length=
 ############################################
 
 TEST_SUITES = {
+    "decimal_magnitude": {
+        "anchor": "0.1 USD",
+        "candidates": ["0.099 USD", "0.101 USD", "0.09 USD", "0.11 USD",
+                       "0.05 USD", "0.2 USD", "0.01 USD", "1 USD"],
+        "description": "Sub-unit magnitude: can decimals be ordered by relative distance?",
+    },
     "digit_bias": {
         "anchor": "321 ml",
         "candidates": ["320 ml", "329 ml", "312 ml", "301 ml", "231 ml",
@@ -165,6 +207,24 @@ TEST_SUITES = {
                        "200 ml", "250 ml", "300 ml"],
         "description": "Are permuted digits confused with numeric proximity?",
     },
+    "power_of_ten_boundary": {
+        "anchor": "99 kg",
+        "candidates": ["98 kg", "100 kg", "90 kg", "110 kg",
+                       "9.9 kg", "990 kg", "0.99 kg", "9900 kg"],
+        "description": "Magnitude boundary: does crossing 99 to 100 remain a near change?",
+    },
+    "thousand_magnitude": {
+        "anchor": "1000 USD",
+        "candidates": ["999 USD", "1001 USD", "900 USD", "1100 USD",
+                       "500 USD", "2000 USD", "100 USD", "10000 USD"],
+        "description": "Thousands: preserve relative ordering and reciprocal-ratio ties.",
+    },
+    "large_magnitude": {
+        "anchor": "100000 shares",
+        "candidates": ["99900 shares", "100100 shares", "90000 shares", "110000 shares",
+                       "50000 shares", "200000 shares", "10000 shares", "1000000 shares"],
+        "description": "Large values: does ordering remain stable across five to six digits?",
+    },
 }
 
 
@@ -191,14 +251,44 @@ def make_random_suites(n_suites=20, seed=42, units=("ml", "kg", "USD", "shares",
 
 def _spearman(x, y):
     def rank(a):
-        order = np.argsort(a)
-        r = np.empty(len(a))
-        r[order] = np.arange(len(a))
-        return r
+        """Average ranks for ties (the standard Spearman convention)."""
+        values = np.asarray(a, float)
+        order = np.argsort(values, kind="mergesort")
+        sorted_values = values[order]
+        ranks = np.empty(len(values), dtype=float)
+        start = 0
+        while start < len(values):
+            end = start + 1
+            while end < len(values) and sorted_values[end] == sorted_values[start]:
+                end += 1
+            ranks[order[start:end]] = (start + end - 1) / 2.0
+            start = end
+        return ranks
     rx, ry = rank(np.asarray(x, float)), rank(np.asarray(y, float))
     if rx.std() == 0 or ry.std() == 0:
         return float("nan")
     return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def _pairwise_ordering_accuracy(similarities, distances):
+    """Fraction of unequal-distance candidate pairs in the correct order.
+
+    True numeric ties are excluded rather than arbitrarily broken. Predicted
+    similarity ties receive half credit.
+    """
+    correct = 0.0
+    compared = 0
+    for i in range(len(distances)):
+        for j in range(i + 1, len(distances)):
+            if distances[i] == distances[j]:
+                continue
+            compared += 1
+            expected = distances[i] < distances[j]
+            if similarities[i] == similarities[j]:
+                correct += 0.5
+            elif (similarities[i] > similarities[j]) == expected:
+                correct += 1.0
+    return float(correct / compared) if compared else float("nan")
 
 
 def score_suite(model, tokenizer, anchor, candidates, max_length=128):
@@ -212,8 +302,11 @@ def score_suite(model, tokenizer, anchor, candidates, max_length=128):
         abs(math.log(float(c.split()[0].replace(",", "")) / anchor_val))
         for c in candidates
     ]
+    pairwise_accuracy = _pairwise_ordering_accuracy(sims, log_dists)
     return {
         "spearman": _spearman(-sims, log_dists),
+        "pairwise_ordering": pairwise_accuracy,
+        "inversion_rate": 1.0 - pairwise_accuracy,
         "sim_spread": float(sims.max() - sims.min()),
         "ranking": sorted(zip(candidates, sims.tolist()), key=lambda t: -t[1]),
     }
@@ -223,19 +316,27 @@ def ordering_scores(model, tokenizer, suites=None, max_length=128, verbose=False
     """Run all suites; returns flat metrics: ordering@<suite> per suite plus
     ordering_mean and sim_spread_mean (the two headline numbers)."""
     suites = suites or TEST_SUITES
-    out, rhos, spreads = {}, [], []
+    out, rhos, pairwise_scores, inversion_rates, spreads = {}, [], [], [], []
     for name, s in suites.items():
         r = score_suite(model, tokenizer, s["anchor"], s["candidates"], max_length)
         out[f"ordering@{name}"] = round(r["spearman"], 4)
+        out[f"pairwise_ordering@{name}"] = round(r["pairwise_ordering"], 4)
+        out[f"inversion_rate@{name}"] = round(r["inversion_rate"], 4)
         rhos.append(r["spearman"])
+        pairwise_scores.append(r["pairwise_ordering"])
+        inversion_rates.append(r["inversion_rate"])
         spreads.append(r["sim_spread"])
         if verbose:
-            print(f"\n{name}: rho={r['spearman']:.3f}  spread={r['sim_spread']:.3f}"
+            print(f"\n{name}: rho={r['spearman']:.3f}  "
+                f"pairwise={r['pairwise_ordering']:.3f}  "
+                f"inversions={r['inversion_rate']:.3f}  spread={r['sim_spread']:.3f}"
                   f"  ({s['description']})")
             print(f"  Anchor: {s['anchor']}")
             for text, sim in r["ranking"]:
                 print(f"  {text:>12} : {sim:.4f}")
     out["ordering_mean"] = round(float(np.nanmean(rhos)), 4)
+    out["pairwise_ordering_mean"] = round(float(np.nanmean(pairwise_scores)), 4)
+    out["inversion_rate_mean"] = round(float(np.nanmean(inversion_rates)), 4)
     out["sim_spread_mean"] = round(float(np.mean(spreads)), 4)
     return out
 
@@ -270,6 +371,8 @@ def evaluate_adapter(
     if include_random_suites:
         rand = ordering_scores(model, tokenizer, suites=make_random_suites())
         metrics["ordering_mean_random"] = rand["ordering_mean"]
+        metrics["pairwise_ordering_mean_random"] = rand["pairwise_ordering_mean"]
+        metrics["inversion_rate_mean_random"] = rand["inversion_rate_mean"]
         metrics["sim_spread_mean_random"] = rand["sim_spread_mean"]
 
     del model
