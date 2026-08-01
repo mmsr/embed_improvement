@@ -5,6 +5,8 @@ import inspect
 import json
 import os
 import random
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,6 +21,14 @@ from training.data import TripletDataset, make_triplet_collator
 from training.experiment import new_run_id, run_dir, save_checkpoint, save_run
 from training.losses import get_loss_fn
 from training.model import build_model, save_aux_heads
+
+
+def _append_jsonl(path: str | Path, row: dict) -> None:
+    """Append one durable history record that remains readable during training."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
 
 
 def set_seed(seed: int):
@@ -72,9 +82,9 @@ def _loss_kwargs(loss_fn, config: RunConfig) -> dict:
     return {k: v for k, v in candidates.items() if k in params}
 
 
-def _run_batch(model, batch, loss_fn, loss_kwargs: dict):
+def _run_batch(model, batch, loss_fn, loss_kwargs: dict, return_outputs: bool = False):
     outputs = model(batch)
-    return loss_fn(
+    result = loss_fn(
         anchor_emb=outputs["a_emb"],
         pos_emb=outputs["p_emb"],
         neg_emb=outputs["n_emb"],
@@ -86,18 +96,41 @@ def _run_batch(model, batch, loss_fn, loss_kwargs: dict):
         neg_value=batch["negative_number"],
         **loss_kwargs,
     )
+    return (*result, outputs) if return_outputs else result
 
 
 def _evaluate_loss(model, loader, loss_fn, loss_kwargs: dict) -> dict:
     model.eval()
     totals: dict[str, float] = {}
+    n_examples = 0
     with torch.no_grad():
         for batch in loader:
-            loss, components = _run_batch(model, batch, loss_fn, loss_kwargs)
+            loss, components, outputs = _run_batch(
+                model, batch, loss_fn, loss_kwargs, return_outputs=True
+            )
             totals["loss"] = totals.get("loss", 0.0) + loss.item()
             for k, v in components.items():
                 totals[k] = totals.get(k, 0.0) + v
-    return {k: v / len(loader) for k, v in totals.items()}
+
+            pos_sim = (outputs["a_emb"] * outputs["p_emb"]).sum(dim=-1)
+            neg_sim = (outputs["a_emb"] * outputs["n_emb"]).sum(dim=-1)
+            batch_size = pos_sim.numel()
+            n_examples += batch_size
+            totals["triplet_correct"] = totals.get("triplet_correct", 0.0) + (
+                pos_sim > neg_sim
+            ).float().sum().item()
+            totals["cosine_gap_sum"] = totals.get("cosine_gap_sum", 0.0) + (
+                pos_sim - neg_sim
+            ).sum().item()
+
+    metrics = {
+        k: v / len(loader)
+        for k, v in totals.items()
+        if k not in {"triplet_correct", "cosine_gap_sum"}
+    }
+    metrics["triplet_accuracy"] = totals.get("triplet_correct", 0.0) / max(n_examples, 1)
+    metrics["cosine_gap"] = totals.get("cosine_gap_sum", 0.0) / max(n_examples, 1)
+    return metrics
 
 
 def _epoch_ordering(accelerator, model, tokenizer) -> dict:
@@ -126,6 +159,9 @@ def train_one_run(config: RunConfig, work_dir: str) -> dict:
     )
     accel_state_dir = os.path.join(work_dir, "runs", run_id, "accelerator_state")
     os.makedirs(accel_state_dir, exist_ok=True)
+    history_dir = Path(work_dir) / "runs" / run_id / "training"
+    step_history_path = history_dir / "step_metrics.jsonl"
+    epoch_history_path = history_dir / "epoch_metrics.jsonl"
 
     accelerator = Accelerator()
     model, tokenizer = build_model(config)
@@ -196,17 +232,28 @@ def train_one_run(config: RunConfig, work_dir: str) -> dict:
                 epoch_totals[k] = epoch_totals.get(k, 0.0) + v
 
             if (current_global_step + 1) % 100 == 0 or current_global_step == 0:
+                step_log = {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "run_id": run_id,
+                    "loss_fn": config.loss_fn,
+                    "seed": config.seed,
+                    "epoch": epoch + 1,
+                    "global_step": current_global_step + 1,
+                    "train_loss": loss.item(),
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                    **{f"train_{k}": v for k, v in components.items()},
+                }
                 accelerator.print(
                     f"Step {current_global_step + 1} | loss {loss.item():.4f} | {components}"
                 )
-                wandb.log(
-                    {
-                        "train_loss_step": loss.item(),
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "global_step": current_global_step + 1,
-                        "epoch": epoch,
-                    }
-                )
+                wandb.log({
+                    "train_loss_step": loss.item(),
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "global_step": current_global_step + 1,
+                    "epoch": epoch,
+                })
+                if accelerator.is_main_process:
+                    _append_jsonl(step_history_path, step_log)
 
             if (current_global_step + 1) % config.save_checkpoint_steps == 0:
                 accelerator.save_state(accel_state_dir)
@@ -231,6 +278,7 @@ def train_one_run(config: RunConfig, work_dir: str) -> dict:
         if "loss" in train_metrics:
             epoch_log["train_loss"] = train_metrics["loss"]
 
+        ordering = {}
         if config.ordering_eval_each_epoch:
             ordering = _epoch_ordering(accelerator, model, tokenizer)
             if ordering:
@@ -241,6 +289,20 @@ def train_one_run(config: RunConfig, work_dir: str) -> dict:
                 epoch_log["sim_spread_mean"] = ordering["sim_spread_mean"]
                 accelerator.print(f"Epoch {epoch + 1} ordering probes: {ordering}")
             model.train()
+
+        history_row = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "run_id": run_id,
+            "loss_fn": config.loss_fn,
+            "seed": config.seed,
+            "epoch": epoch + 1,
+            "global_step": current_global_step + 1,
+            **{f"train_{k}": v for k, v in train_metrics.items()},
+            **{f"val_{k}": v for k, v in val_metrics.items()},
+            **ordering,
+        }
+        if accelerator.is_main_process:
+            _append_jsonl(epoch_history_path, history_row)
 
         wandb.log(epoch_log)
         accelerator.print(f"Epoch {epoch + 1} | train {train_metrics} | val {val_metrics}")
@@ -267,4 +329,9 @@ def train_one_run(config: RunConfig, work_dir: str) -> dict:
     wandb.finish()
 
     accelerator.print(f"Run {run_id} complete. Final adapter saved to {final_dir}")
-    return {"run_id": run_id, "run_dir": str(final_dir)}
+    return {
+        "run_id": run_id,
+        "run_dir": str(final_dir),
+        "step_history": str(step_history_path),
+        "epoch_history": str(epoch_history_path),
+    }
