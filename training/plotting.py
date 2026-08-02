@@ -272,6 +272,83 @@ def plot_evaluation_comparison(
     return paths + [str(table_path)]
 
 
+def plot_checkpoint_comparison(
+    work_dir: str | Path,
+    run_ids: Iterable[str] | None = None,
+    eval_split: str = "val",
+    output_dir: str | Path | None = None,
+) -> list[str]:
+    """Plot common validation metrics for every saved epoch across runs/seeds."""
+    import matplotlib.pyplot as plt
+
+    registry_path = Path(work_dir) / "runs" / "checkpoint_registry.jsonl"
+    rows = _read_jsonl(registry_path)
+    selected = set(run_ids) if run_ids is not None else None
+    rows = [
+        row for row in rows
+        if (selected is None or row.get("run_id") in selected)
+        and row.get("eval_split") == eval_split
+    ]
+    if not rows:
+        raise FileNotFoundError(f"No {eval_split!r} checkpoint rows found in {registry_path}")
+
+    suffix = "/triplet_accuracy"
+    prefixes = sorted({
+        key[:-len(suffix)] for row in rows for key in row if key.endswith(suffix)
+    })
+    if len(prefixes) != 1:
+        raise ValueError(f"Expected one checkpoint metric prefix, found {prefixes}")
+    prefix = prefixes[0]
+    panels = [
+        (f"{prefix}/triplet_accuracy", "Triplet accuracy", (0.0, 1.02)),
+        (f"{prefix}/recall@1", "Recall@1", (0.0, 1.02)),
+        ("ordering_mean_random", "Random-suite Spearman", (-0.05, 1.05)),
+        ("pairwise_ordering_mean_random", "Random pairwise ordering", (0.0, 1.02)),
+    ]
+
+    by_run: dict[str, list[dict]] = {}
+    for row in rows:
+        by_run.setdefault(row["run_id"], []).append(row)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    for key, title, limits in panels:
+        axis = axes.flat[panels.index((key, title, limits))]
+        for run_id, run_rows in sorted(by_run.items()):
+            run_rows.sort(key=lambda row: row["epoch"])
+            first = run_rows[0]
+            label = f"{first.get('loss_fn', 'unknown')} · seed {first.get('seed', '?')}"
+            axis.plot(
+                [row["epoch"] for row in run_rows],
+                [row.get(key) for row in run_rows],
+                marker="o",
+                label=label,
+            )
+        axis.set(title=title, xlabel="Epoch", ylabel=title, ylim=limits)
+        axis.grid(alpha=0.2)
+
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=min(3, len(labels)), fontsize=8)
+    fig.suptitle(f"Per-epoch {eval_split} checkpoint comparison", fontsize=12)
+    fig.tight_layout(rect=(0, 0.1, 1, 0.96))
+
+    output = Path(output_dir) if output_dir else Path(work_dir) / "runs" / "figures"
+    output.mkdir(parents=True, exist_ok=True)
+    paths = _save_figure(fig, output / f"checkpoint_comparison_{eval_split}")
+    plt.close(fig)
+
+    table_path = output / f"checkpoint_comparison_{eval_split}.csv"
+    fieldnames = [
+        "run_id", "loss_fn", "seed", "epoch", "checkpoint_path",
+        *[key for key, _, _ in panels],
+        "ordering_mean", "inversion_rate_mean_random", "sim_spread_mean_random",
+    ]
+    with table_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(sorted(rows, key=lambda row: (row["run_id"], row["epoch"])))
+    return paths + [str(table_path)]
+
+
 def generate_experiment_graphs(
     work_dir: str | Path,
     run_ids: Iterable[str] | None = None,
@@ -286,4 +363,9 @@ def generate_experiment_graphs(
     artifacts["evaluation_comparison"] = plot_evaluation_comparison(
         work_dir, selected, eval_split=eval_split
     )
+    checkpoint_registry = Path(work_dir) / "runs" / "checkpoint_registry.jsonl"
+    if checkpoint_registry.exists():
+        artifacts["checkpoint_comparison"] = plot_checkpoint_comparison(
+            work_dir, selected, eval_split=eval_split
+        )
     return artifacts
