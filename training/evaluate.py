@@ -7,6 +7,10 @@ from __future__ import annotations
 import json
 import math
 import random
+import gc
+import time
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -351,6 +355,9 @@ def evaluate_adapter(
     triplet_files: dict[str, str] | None = None,
     include_random_suites: bool = True,
     verbose: bool = True,
+    batch_size: int = 32,
+    max_length: int = 128,
+    random_suite_seed: int = 42,
 ) -> dict:
     """Evaluate one checkpoint end to end. triplet_files maps a short label
     (e.g. 'test_same') to a JSONL path; labels prefix the metric names.
@@ -361,15 +368,28 @@ def evaluate_adapter(
     for label, path in (triplet_files or {}).items():
         if verbose:
             print(f"── triplets: {label} ──")
-        res = evaluate_triplets(model, tokenizer, path)
+        res = evaluate_triplets(
+            model,
+            tokenizer,
+            path,
+            batch_size=batch_size,
+            max_length=max_length,
+        )
         metrics.update({f"{label}/{k}": v for k, v in res.items()})
         if verbose:
             for k, v in res.items():
                 print(f"  {k:<20s}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
-    metrics.update(ordering_scores(model, tokenizer, verbose=verbose))
+    metrics.update(
+        ordering_scores(model, tokenizer, max_length=max_length, verbose=verbose)
+    )
     if include_random_suites:
-        rand = ordering_scores(model, tokenizer, suites=make_random_suites())
+        rand = ordering_scores(
+            model,
+            tokenizer,
+            suites=make_random_suites(seed=random_suite_seed),
+            max_length=max_length,
+        )
         metrics["ordering_mean_random"] = rand["ordering_mean"]
         metrics["pairwise_ordering_mean_random"] = rand["pairwise_ordering_mean"]
         metrics["inversion_rate_mean_random"] = rand["inversion_rate_mean"]
@@ -379,3 +399,135 @@ def evaluate_adapter(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return metrics
+
+
+def evaluate_epoch_checkpoints(
+    base_model: str,
+    work_dir: str,
+    run_id: str,
+    triplet_files: dict[str, str],
+    eval_split: str = "val",
+    include_random_suites: bool = True,
+    overwrite: bool = False,
+    verbose: bool = True,
+    batch_size: int = 32,
+    max_length: int = 128,
+    random_suite_seed: int = 42,
+) -> list[dict]:
+    """Evaluate every runs/<run_id>/checkpoints/epoch_* adapter.
+
+    Writes a detailed per-run JSON artifact and appends one flat row per epoch
+    to runs/checkpoint_registry.jsonl, making epochs and seeds easy to compare.
+    The held-out-test policy remains the caller's responsibility.
+    """
+    run_root = Path(work_dir) / "runs" / run_id
+    checkpoint_root = run_root / "checkpoints"
+    config_path = run_root / "config.json"
+    run_config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    checkpoint_candidates = checkpoint_root.glob("epoch_*")
+    checkpoints = sorted(
+        (
+            path
+            for path in checkpoint_candidates
+            if (path / "adapter_config.json").is_file()
+            and any(
+                (path / filename).is_file()
+                for filename in ("adapter_model.safetensors", "adapter_model.bin")
+            )
+        ),
+        key=lambda path: int(path.name.split("_", 1)[1]),
+    )
+    if not checkpoints:
+        raise FileNotFoundError(f"No epoch checkpoints found under {checkpoint_root}")
+
+    artifact_path = run_root / "evaluations" / f"epoch_metrics_{eval_split}.json"
+    if artifact_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Epoch evaluation already exists: {artifact_path}. "
+            "Pass overwrite=True only for an intentional replacement."
+        )
+
+    eval_file = ";".join(f"{name}:{path}" for name, path in triplet_files.items())
+    registry_path = Path(work_dir) / "runs" / "checkpoint_registry.jsonl"
+    prior_keys = set()
+    if registry_path.exists():
+        with registry_path.open(encoding="utf-8") as existing:
+            for line in existing:
+                if line.strip():
+                    row = json.loads(line)
+                    prior_keys.add((row.get("run_id"), row.get("epoch"), row.get("eval_file")))
+
+    records = []
+    for checkpoint_path in checkpoints:
+        epoch = int(checkpoint_path.name.split("_", 1)[1])
+        key = (run_id, epoch, eval_file)
+        if key in prior_keys and not overwrite:
+            raise ValueError(
+                f"Checkpoint result already recorded for run={run_id}, "
+                f"epoch={epoch}, eval_file={eval_file}"
+            )
+        if verbose:
+            print(f"\n── Evaluating {run_id}, epoch {epoch} ──")
+        started_at = time.perf_counter()
+        metrics = evaluate_adapter(
+            base_model=base_model,
+            adapter_path=str(checkpoint_path),
+            triplet_files=triplet_files,
+            include_random_suites=include_random_suites,
+            verbose=verbose,
+            batch_size=batch_size,
+            max_length=max_length,
+            random_suite_seed=random_suite_seed,
+        )
+        duration_seconds = time.perf_counter() - started_at
+        records.append({
+            "run_id": run_id,
+            "tag": run_config.get("tag"),
+            "loss_fn": run_config.get("loss_fn"),
+            "seed": run_config.get("seed"),
+            "epoch": epoch,
+            "checkpoint_path": str(checkpoint_path),
+            "eval_split": eval_split,
+            "eval_file": eval_file,
+            "evaluation_duration_seconds": round(duration_seconds, 3),
+            **metrics,
+        })
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    artifact = {
+        "artifact_type": "epoch_checkpoint_evaluations",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "base_model": base_model,
+        "run_id": run_id,
+        "config": run_config,
+        "eval_split": eval_split,
+        "eval_file": eval_file,
+        "epochs": records,
+    }
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+    # overwrite=True refreshes this run/split's rows without touching other runs.
+    if overwrite and registry_path.exists():
+        retained = []
+        with registry_path.open(encoding="utf-8") as existing:
+            for line in existing:
+                if line.strip():
+                    row = json.loads(line)
+                    if not (row.get("run_id") == run_id and row.get("eval_file") == eval_file):
+                        retained.append(row)
+        with registry_path.open("w", encoding="utf-8") as registry:
+            for row in retained:
+                registry.write(json.dumps(row) + "\n")
+
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with registry_path.open("a", encoding="utf-8") as registry:
+        for record in records:
+            registry.write(json.dumps(record) + "\n")
+
+    if verbose:
+        print(f"\nDetailed epoch results: {artifact_path}")
+        print(f"Combined checkpoint registry: {registry_path}")
+    return records
