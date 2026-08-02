@@ -164,6 +164,15 @@ def train_one_run(config: RunConfig, work_dir: str) -> dict:
     epoch_history_path = history_dir / "epoch_metrics.jsonl"
 
     accelerator = Accelerator()
+    run_root = Path(work_dir) / "runs" / run_id
+    if accelerator.is_main_process:
+        run_root.mkdir(parents=True, exist_ok=True)
+        (run_root / "config.json").write_text(
+            json.dumps(asdict(config), indent=2) + "\n",
+            encoding="utf-8",
+        )
+    accelerator.wait_for_everyone()
+
     model, tokenizer = build_model(config)
     loss_fn = get_loss_fn(config.loss_fn)
     loss_kwargs = _loss_kwargs(loss_fn, config)
